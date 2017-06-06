@@ -3,7 +3,6 @@ import zmq
 import zmq.asyncio
 import pickle
 import logging
-import random
 
 log = logging.getLogger(__name__)
 
@@ -67,14 +66,16 @@ class ClientSession:
 
     async def process_update(self):
         while True:
-            try:
-                topic, update = await self.update_sock.recv_multipart()
-                update = pickle.loads(update)
-                for cb in self.callbacks:
-                    await cb(update)
-            except:
-                log.exception('', exc_info=True)
-                break
+            # try:
+            topic, update = await self.update_sock.recv_multipart()
+            update = pickle.loads(update)
+            for cb in self.callbacks:
+                await cb(update)
+            # except (KeyboardInterrupt, asyncop.CancelledError):
+            #     raise
+            # except:
+            #     log.exception('', exc_info=True)
+            #     break
 
 
 class ServerSession:
@@ -96,22 +97,23 @@ class ServerSession:
         self.update_sock.bind(UPDATE_SERVER_URL)
 
     async def process_cmd(self):
-        previous_session_id = 0
+        previous_session_id = {}
         while True:
-            try:
-                identity, session_id, cmd = await self.cmd_sock.recv_multipart()
-                #  print(f'Recieved command: from: {identity} ({pickle.loads(cmd)})')
-                #  asyncio.sleep(0.5 * random.randrange(1, 3))
-                await self.cmd_sock.send_multipart([identity, session_id, cmd])
-                session_id = pickle.loads(session_id)
-                if session_id != (previous_session_id + 1):
-                    log.warning(f"Missed session_id {previous_session_id} current: {session_id}")
-                previous_session_id = session_id
-                if (int(session_id) % 1000) == 0:
-                    log.info(f"{session_id}")
-            except:
-                log.exception('', exc_info=True)
-                break
+            # try:
+            identity, session_id, cmd = await self.cmd_sock.recv_multipart()
+            await self.cmd_sock.send_multipart([identity, session_id, cmd])
+            session_id = int(pickle.loads(session_id))
+            if session_id != (previous_session_id.get(identity, 0) + 1):
+                log.warning(f"Missed session_id {previous_session_id.get(identity, 0)} "
+                            "current: {session_id}")
+            previous_session_id[identity] = session_id
+            if (previous_session_id[identity] % 1000) == 0:
+                log.info(f"{identity}, {session_id}")
+            # except (KeyboardInterrupt, asyncop.CancelledError):
+            #     raise
+            # except:
+            #     log.exception('', exc_info=True)
+            #     break
 
     async def publish(self, topic, msg):
         await self.update_sock.send_multipart([topic.encode('ascii'), pickle.dumps(msg)])
