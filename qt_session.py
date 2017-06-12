@@ -75,6 +75,12 @@ class UpdateSubSocket(QtCore.QObject):
 
         self.loop()
 
+    def stop(self):
+        log.debug('update socket stop')
+        self.running = False
+        self.socket.unsubscribe('')
+        self.socket.close()
+
     def loop(self):
         self.message.emit('running ...')
         while self.running:
@@ -86,7 +92,7 @@ class UpdateSubSocket(QtCore.QObject):
                 log.warning('reset detected')
             except:
                 log.exception('Unhandled exception in loop:', exc_info=True)
-
+        self.stop()
 
 class CmdSocket(QtCore.QObject):
     TIMEOUT = 10000
@@ -107,6 +113,10 @@ class CmdSocket(QtCore.QObject):
         self.cmd_sock = QtPyDealerSocket(self.context.socket(zmq.DEALER))
         self.cmd_sock.connect(session.CMD_CLIENT_URL)
         self.session_id = 0
+
+    def stop(self):
+        log.debug('cmd socket stop')
+        self.cmd_sock.close()
 
     def cmd(self, cmd):
         """Send a command to the server and wait for the response."""
@@ -139,6 +149,7 @@ class CmdSocket(QtCore.QObject):
 
 class Session(QtCore.QObject):
     do_cmd = QtCore.pyqtSignal(object)
+    do_stop = QtCore.pyqtSignal()
     cmd_response = QtCore.pyqtSignal(object)
     msg_received = QtCore.pyqtSignal(object)
 
@@ -161,6 +172,7 @@ class Session(QtCore.QObject):
         self.cmd_socket.cmd_response.connect(lambda msg: self.cmd_response.emit(msg))
 
         self.do_cmd.connect(self.cmd_socket.cmd)
+        self.do_stop.connect(self.cmd_socket.stop)
 
         QtCore.QTimer.singleShot(0, self.update_thread.start)
         QtCore.QTimer.singleShot(0, self.cmd_thread.start)
@@ -170,7 +182,11 @@ class Session(QtCore.QObject):
     def cmd(self, cmd):
         self.do_cmd.emit(cmd)
 
+    def stop(self):
+        self.do_stop.emit()
+
     def close(self):
+        self.stop()
         self.update_socket.running = False
         for thread in self.all_threads:
             thread.quit()
