@@ -16,6 +16,8 @@ LIFECYCLE_CLIENT_URL = 'tcp://localhost:5557'
 CMD_SERVER_URL = 'tcp://*:5555'
 UPDATE_SERVER_URL = 'tcp://*:5556'
 LIFECYCLE_SERVER_URL = 'tcp://*:5557'
+STATE_TOPIC = 'system.lifecycle.state'
+HEARTBEAT_TOPIC = 'system.lifecycle.heartbeat'
 
 CTX = zmq.asyncio.Context()
 
@@ -89,8 +91,18 @@ class PyPubSubSocket(PyZmqSocket):
         return (topic.decode(), *[pickle.loads(_) for _ in rest])
 
 
+class ClientSessionState(Enum):
+
+    CLOSED = 0
+    CONNECTING = 1
+    CONNECTED = 2
+    SUBSCRIBED = 3
+    STOPPED = 4
+
+
 class ClientSession:
 
+    TIME_TO_STOP = False
     TIMEOUT = 10000  # Timeout for RPC responses (10s)
 
     @classmethod
@@ -104,8 +116,11 @@ class ClientSession:
         asyncio.set_event_loop(loop)
 
     def __init__(self):
+        self.client_state = ClientSessionState.CLOSED
         self.cmd_sock = None
         self.update_sock = None
+        self.lifecycle_sock = None
+        self.update_topic = None
         self.session_id = 0
         self.callbacks = []
 
@@ -116,17 +131,27 @@ class ClientSession:
 
         self.cmd_sock = PyDealerSocket(CTX.socket(zmq.DEALER))
         self.update_sock = PyPubSubSocket(CTX.socket(zmq.SUB))
+        self.lifecycle_sock = PyPubSubSocket(CTX.socket(zmq.SUB))
 
         self.cmd_sock.connect(CMD_CLIENT_URL)
         self.update_sock.connect(UPDATE_CLIENT_URL)
+        self.lifecycle_sock.connect(LIFECYCLE_CLIENT_URL)
+        self.lifecycle_sock.subscribe('')
 
-    def stop(self):
-        self.cmd_sock.close()
-        self.update_sock.close()
+        self.client_state = ClientSessionState.CONNECTING
+
+    async def stop(self):
+        await self.on_stopped()
+        for sock in (self.cmd_sock, self.update_sock, self.lifecycle_sock):
+            if sock and not sock.closed:
+                sock.close()
+
+    def exit(self):
+        self.__class__.TIME_TO_STOP = True
 
     async def restart(self):
         log.warning('Restarting connection to server.')
-        self.stop()
+        await self.stop()
         self.start()
 
     async def cmd(self, cmd):
@@ -156,17 +181,55 @@ class ClientSession:
 
     def register(self, topic, callback):
         """Register a callback function to be called when a message is received on the given topic."""
-        self.update_sock.subscribe(topic)
         self.callbacks.append(callback)
+
+    async def on_connected(self):
+        pass
+
+    async def run(self):
+        results = await asyncio.gather(
+            self.process_update(),
+            self.process_lifecycle(),
+            return_exceptions=True)
+        for e in results:
+            if (isinstance(e, Exception) and
+                    not isinstance(e, asyncio.CancelledError)):
+                logging.error("Exception thrown during shutdown",
+                              exc_info=(type(e), e, e.__traceback__))
 
     async def process_update(self):
         """Process updates received from the server."""
 
-        while True:
+        while not self.__class__.TIME_TO_STOP:
             try:
                 topic, update = await self.update_sock.recv_py_multipart()
                 for cb in self.callbacks:
                     await cb(update)
+            except asyncio.CancelledError:
+                pass  # We get CanelledError when doing the restart logic.
+            except ServerResetException:
+                await self.restart()
+            except:
+                log.exception('Unhandled exception on process_update:', exc_info=True)
+
+        await self.stop()
+
+    async def process_lifecycle(self):
+        """Process lifecycle messages received from the server."""
+
+        while not self.__class__.TIME_TO_STOP:
+            try:
+                topic, state = await self.lifecycle_sock.recv_py_multipart()
+                if topic == STATE_TOPIC:
+                    if state == ServerState.STOP:
+                        await self.restart()
+                elif (topic == HEARTBEAT_TOPIC or
+                        (topic == STATE_TOPIC and state == ServerState.START)):
+                    if self.client_state == ClientSessionState.CONNECTING:
+                        self.client_state = ClientSessionState.CONNECTED
+                        await self.on_connected()
+                else:
+                    log.warning(f'Ignoring unknon topic on lifecycle socket {topic}')
             except asyncio.CancelledError:
                 raise
             except ServerResetException:
@@ -174,10 +237,12 @@ class ClientSession:
             except:
                 log.exception('Unhandled exception on process_update:', exc_info=True)
 
+        await self.stop()
+
 
 class ServerSession:
 
-    STATE_TOPIC = 'system.lifecycle.state'
+    TIME_TO_STOP = False
 
     @classmethod
     def install(cls):
@@ -215,8 +280,10 @@ class ServerSession:
         self.lifecycle_sock.bind(LIFECYCLE_SERVER_URL)
 
         await self.set_state(ServerState.START)
+        await self.on_start()
 
     async def stop(self):
+        await self.on_stop()
         await self.set_state(ServerState.STOP)
         self.cmd_sock.close()
         self.update_sock.close()
@@ -226,13 +293,43 @@ class ServerSession:
         await self.stop()
         await self.start()
 
+    def exit(self):
+        self.__class__.TIME_TO_STOP = True
+
+    def is_time_to_stop(self):
+        return self.__class__.TIME_TO_STOP
+
     async def set_state(self, state):
         self.state = state
-        await self.lifecycle_sock.send_py_multipart(self.STATE_TOPIC, [self.server_session_id, state])
+        log.debug(f'Set state: {state}')
+        await self.lifecycle_sock.send_py_multipart(STATE_TOPIC, [state])
+
+    async def run(self):
+        results = await asyncio.gather(
+            self.process_cmd(),
+            self.process_heartbeat(),
+            return_exceptions=True)
+        for e in results:
+            if (isinstance(e, Exception) and
+                    not isinstance(e, asyncio.CancelledError)):
+                logging.error("Exception thrown during shutdown",
+                              exc_info=(type(e), e, e.__traceback__))
+
+    async def process_heartbeat(self):
+        while not self.TIME_TO_STOP:
+            try:
+                await asyncio.sleep(1)
+                await self.lifecycle_sock.send_py_multipart(HEARTBEAT_TOPIC, [time.time()])
+            except asyncio.CancelledError:
+                raise
+            # except:
+            #     log.exception('Unhandled exception in process_heartbeat',
+            #                   exc_info=True)
+        await self.stop()
 
     async def process_cmd(self):
         previous_session_id = {}
-        while True:
+        while not self.TIME_TO_STOP:
             try:
                 identity, session_id, cmd = await self.cmd_sock.recv_py_multipart()
                 await self.cmd_sock.send_py_multipart(identity, [session_id, cmd])
@@ -246,6 +343,7 @@ class ServerSession:
                 raise
             except:
                 log.exception('Unhandled exception on process_cmd:', exc_info=True)
+        await self.stop()
 
     async def publish(self, topic, msg):
         await self.update_sock.send_py_multipart(topic, [msg])
