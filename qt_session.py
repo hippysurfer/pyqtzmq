@@ -52,6 +52,7 @@ class QtPyPubSubSocket(session.PyZmqSocket):
 
 
 class UpdateSubSocket(QtCore.QObject):
+    TIMEOUT = 1000
     message = QtCore.pyqtSignal(str)
 
     def __init__(self, context):
@@ -85,14 +86,18 @@ class UpdateSubSocket(QtCore.QObject):
         self.message.emit('running ...')
         while self.running:
             try:
-                topic, count = self.socket.recv_py_multipart()
-                if (count % 100000) == 0:
-                    self.message.emit(f'{topic}, {count}')
+                events = self.socket.poll(timeout=self.TIMEOUT)
+                if events != 0:  # Not a timeout
+                    topic, count = self.socket.recv_py_multipart()
+                    if (count % 100000) == 0:
+                        self.message.emit(f'{topic}, {count}')
+                self.thread().eventDispatcher().processEvents(
+                    QtCore.QEventLoop.AllEvents)
             except session.ServerResetException:
                 log.warning('reset detected')
             except:
                 log.exception('Unhandled exception in loop:', exc_info=True)
-        self.stop()
+
 
 class CmdSocket(QtCore.QObject):
     TIMEOUT = 10000
@@ -173,6 +178,7 @@ class Session(QtCore.QObject):
 
         self.do_cmd.connect(self.cmd_socket.cmd)
         self.do_stop.connect(self.cmd_socket.stop)
+        self.do_stop.connect(self.update_socket.stop)
 
         QtCore.QTimer.singleShot(0, self.update_thread.start)
         QtCore.QTimer.singleShot(0, self.cmd_thread.start)
@@ -187,7 +193,7 @@ class Session(QtCore.QObject):
 
     def close(self):
         self.stop()
-        self.update_socket.running = False
+        # self.update_socket.running = False
         for thread in self.all_threads:
             thread.quit()
         for thread in self.all_threads:
